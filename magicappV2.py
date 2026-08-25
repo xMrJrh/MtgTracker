@@ -6,6 +6,7 @@ import re
 import requests
 import os
 import urllib.parse
+from streamlit_gsheets import GSheetsConnection
 
 # --- CONFIGURATION DE LA PAGE ---
 st.set_page_config(page_title="MTG Finance & Tracker", page_icon="📈", layout="wide")
@@ -16,38 +17,58 @@ WEB_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
 BASIC_LANDS = ["Plains", "Island", "Swamp", "Mountain", "Forest", "Snow-Covered Plains", "Snow-Covered Island", "Snow-Covered Swamp", "Snow-Covered Mountain", "Snow-Covered Forest", "Wastes"]
-HISTORY_FILE = "mtg_prices_history.csv"
 
 # ==========================================
-# GESTION DE L'HISTORIQUE DES PRIX
+# GESTION DE L'HISTORIQUE DES PRIX (GOOGLE SHEETS)
 # ==========================================
 
-def update_price_history(scryfall_data):
+def get_gsheets_connection():
+    return st.connection("gsheets", type=GSheetsConnection)
+
+def update_price_history(scryfall_data, format_name="Global"):
     today = datetime.now().strftime('%Y-%m-%d')
-    if os.path.exists(HISTORY_FILE):
-        df = pd.read_csv(HISTORY_FILE)
-    else:
-        df = pd.DataFrame(columns=["Date", "Card Name", "Price"])
-        
-    new_rows = []
-    for c in scryfall_data:
-        name = c.get("name")
-        price = float(c.get("prices", {}).get("eur") or 0.0)
-        if price > 0:
-            already_recorded = ((df['Date'] == today) & (df['Card Name'] == name)).any()
-            if not already_recorded:
-                new_rows.append({"Date": today, "Card Name": name, "Price": price})
-                
-    if new_rows:
-        df_new = pd.DataFrame(new_rows)
-        df = pd.concat([df, df_new], ignore_index=True)
-        df.to_csv(HISTORY_FILE, index=False)
+    conn = get_gsheets_connection()
+    
+    # Fonction interne pour écrire dans un onglet spécifique
+    def _write_to_sheet(sheet_name):
+        try:
+            df = conn.read(worksheet=sheet_name, usecols=[0, 1, 2], ttl=0)
+        except:
+            df = pd.DataFrame(columns=["Date", "Card Name", "Price"])
+            
+        new_rows = []
+        for c in scryfall_data:
+            name = c.get("name")
+            price = float(c.get("prices", {}).get("eur") or 0.0)
+            
+            if price > 0:
+                if df.empty or not ((df['Date'] == today) & (df['Card Name'] == name)).any():
+                    new_rows.append({"Date": today, "Card Name": name, "Price": price})
+                    
+        if new_rows:
+            df_new = pd.DataFrame(new_rows)
+            df_updated = pd.concat([df, df_new], ignore_index=True)
+            try:
+                conn.update(worksheet=sheet_name, data=df_updated)
+            except Exception:
+                st.warning(f"⚠️ L'onglet '{sheet_name}' n'existe pas dans votre Google Sheet.")
+
+    # 1. On écrit toujours dans l'onglet Général
+    _write_to_sheet("Global")
+    
+    # 2. On écrit dans l'onglet du format spécifique (si différent de Global)
+    if format_name and format_name != "Global":
+        _write_to_sheet(format_name)
 
 def load_price_history(card_names):
-    if not os.path.exists(HISTORY_FILE):
-        return pd.DataFrame()
-    df = pd.read_csv(HISTORY_FILE)
-    return df[df['Card Name'].isin(card_names)]
+    conn = get_gsheets_connection()
+    try:
+        # On lit l'historique depuis "Global" pour avoir absolument toutes les données
+        df = conn.read(worksheet="Global", usecols=[0, 1, 2], ttl=3600)
+        df = df.dropna(subset=['Card Name'])
+        return df[df['Card Name'].isin(card_names)]
+    except:
+        return pd.DataFrame(columns=["Date", "Card Name", "Price"])
 
 # ==========================================
 # MOTEUR cEDH : LECTURE DIRECTE EDHTOP16
@@ -71,7 +92,6 @@ def get_edhtop16_commanders():
 @st.cache_data(ttl=3600)
 def get_edhtop16_staples(commander_raw_url="ALL"):
     filters = "?tab=staples&sortBy=TOP&staplesSortBy=MOST_PLAYED&timePeriod=ONE_MONTH&maxStanding=16&minEventSize=30"
-    
     if commander_raw_url == "ALL":
         url = f"https://edhtop16.com/{filters}"
     else:
@@ -79,7 +99,6 @@ def get_edhtop16_staples(commander_raw_url="ALL"):
         
     try:
         resp = requests.get(url, headers=WEB_HEADERS, timeout=15)
-        
         if resp.status_code != 200:
             st.error(f"⚠️ Accès bloqué par EDHTop16 (Erreur {resp.status_code}).")
             return []
@@ -107,12 +126,9 @@ def get_edhtop16_staples(commander_raw_url="ALL"):
                 
         if not results:
             st.warning("⚠️ L'algorithme n'a pas trouvé de données JSON de cartes dans la page.")
-            with st.expander("Voir les données brutes (Debug)"):
-                st.code(clean_text[:2000], language="html")
                 
         return results
     except Exception as e:
-        st.error(f"Erreur d'exécution : {e}")
         return []
 
 # ==========================================
@@ -216,19 +232,16 @@ def fetch_scryfall_batch(card_names):
             results.extend(resp.json().get("data", []))
     return results
 
-# Nouvelle fonction : Traduction FR -> EN via Scryfall pour la barre de recherche
 @st.cache_data(ttl=86400, show_spinner=False)
 def translate_search_term(search_term):
     if len(search_term) < 3:
         return []
     try:
         query = urllib.parse.quote(search_term)
-        # L'API Scryfall cherche automatiquement dans toutes les langues
         url = f"https://api.scryfall.com/cards/search?q={query}"
         resp = requests.get(url, headers=SCRYFALL_HEADERS, timeout=5)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
-            # On retourne la liste des noms anglais officiels trouvés
             return [c["name"].lower() for c in data[:15]]
     except:
         pass
@@ -257,7 +270,6 @@ def get_set_and_year(c):
 # ==========================================
 
 def display_interactive_dataframe(df):
-    """Fonction maîtresse qui gère la barre de recherche, le tri et l'affichage des grilles."""
     st.markdown("---")
     col1, col2, col3 = st.columns([2, 1, 1])
     
@@ -266,33 +278,24 @@ def display_interactive_dataframe(df):
     with col2:
         sort_by = st.selectbox("Trier par :", ["Inclusion (Défaut)", "Prix décroissant", "Prix croissant", "Nom (A-Z)"])
     with col3:
-        # st.write("") permet d'aligner le toggle visuellement avec les autres champs
         st.write("")
         show_only_new = st.toggle("🎯 Nouveautés Inédites Uniquement", value=False)
 
     filtered_df = df.copy()
 
-    # 1. Filtre Nouveautés
     if show_only_new:
         filtered_df = filtered_df[filtered_df["Tri_Statut"] == 1]
 
-    # 2. Filtre Recherche (Bilingue)
     if search_query:
-        # Recherche classique (Nom Anglais)
         mask_en = filtered_df['Nom de la Carte'].str.contains(search_query, case=False, na=False)
-        
-        # Traduction invisible via Scryfall pour le Français
         translated_names = translate_search_term(search_query)
         if translated_names:
             pattern = '|'.join([re.escape(n) for n in translated_names])
             mask_fr = filtered_df['Nom de la Carte'].str.contains(pattern, case=False, na=False)
         else:
             mask_fr = pd.Series(False, index=filtered_df.index)
-            
-        # On garde les cartes si elles matchent en EN ou en FR
         filtered_df = filtered_df[mask_en | mask_fr]
 
-    # 3. Tri des données
     if sort_by == "Inclusion (Défaut)":
         sort_col = "Inclusion" if "Inclusion" in filtered_df.columns else "Inclusion Max"
         filtered_df = filtered_df.sort_values(by=["Tri_Statut", sort_col, "Prix €"], ascending=[True, False, False])
@@ -303,11 +306,9 @@ def display_interactive_dataframe(df):
     elif sort_by == "Nom (A-Z)":
         filtered_df = filtered_df.sort_values(by=["Nom de la Carte"], ascending=True)
 
-    # 4. Affichage final
     if filtered_df.empty:
         st.warning("Aucune carte ne correspond à ces critères de recherche ou de tri.")
     else:
-        # Affiche le compteur de cartes
         st.caption(f"Affichage de **{len(filtered_df)}** cartes.")
         display_card_grid(filtered_df)
 
@@ -380,7 +381,9 @@ if menu == "🐉 cEDH (EDHTop16)":
                     with st.spinner("Analyse financière et nouveautés en cours..."):
                         card_names = list(set([c["name"] for c in deck_cards]))
                         scryfall_data = fetch_scryfall_batch(card_names)
-                        update_price_history(scryfall_data)
+                        
+                        # Enregistrement dans "Global" ET dans "cEDH"
+                        update_price_history(scryfall_data, format_name="cEDH")
                         
                         incl_map = {c["name"]: c["inclusion"] for c in deck_cards}
                         table_data = []
@@ -397,11 +400,9 @@ if menu == "🐉 cEDH (EDHTop16)":
                                 "Prix €": float(c.get("prices", {}).get("eur") or 0.0),
                             })
                             
-                        # Sauvegarde des données en mémoire pour ne pas les perdre lors de la recherche
                         st.session_state['cedh_df'] = pd.DataFrame(table_data)
                         st.session_state['cedh_deck_view'] = deck_choisi
 
-        # Affiche le panneau interactif si on a des données en mémoire pour CE deck précis
         if 'cedh_df' in st.session_state and st.session_state.get('cedh_deck_view') == deck_choisi:
             display_interactive_dataframe(st.session_state['cedh_df'])
 
@@ -436,7 +437,9 @@ elif menu == "🏠 Accueil (Toutes Nouveautés)":
             
         status_text.text("Vérification avec Scryfall...")
         scryfall_data = fetch_scryfall_batch(list(global_new_cards.keys()))
-        update_price_history(scryfall_data)
+        
+        # Le scanner global enregistre uniquement dans l'onglet Global
+        update_price_history(scryfall_data, format_name="Global")
         
         home_cards = []
         for c in scryfall_data:
@@ -444,7 +447,6 @@ elif menu == "🏠 Accueil (Toutes Nouveautés)":
             front_name = full_name.split(" // ")[0].strip()
             statut_nom, tri_val = determine_card_status(c, RECENT_SETS)
             
-            # Pour l'accueil, on ne sauvegarde de base que les nouveautés
             if tri_val == 1:
                 stats = global_new_cards.get(front_name) or global_new_cards.get(full_name) or {}
                 home_cards.append({
@@ -503,7 +505,9 @@ else:
                     
                 status_text.text("Enrichissement avec Scryfall...")
                 scryfall_data = fetch_scryfall_batch(list(format_new_cards.keys()))
-                update_price_history(scryfall_data)
+                
+                # Enregistre dans Global ET dans l'onglet du format
+                update_price_history(scryfall_data, format_name=menu)
                 
                 format_cards = []
                 for c in scryfall_data:
@@ -538,7 +542,9 @@ else:
                         if deck_cards:
                             with st.spinner("Analyse financière avec Scryfall..."):
                                 scryfall_data = fetch_scryfall_batch([c["name"] for c in deck_cards])
-                                update_price_history(scryfall_data)
+                                
+                                # Enregistre dans Global ET dans l'onglet du format
+                                update_price_history(scryfall_data, format_name=menu)
                                 
                                 incl_map = {c["name"]: c["inclusion"] for c in deck_cards}
                                 table_data = []
@@ -558,6 +564,5 @@ else:
                                 st.session_state['format_df'] = pd.DataFrame(table_data)
                                 st.session_state['format_deck_view'] = deck_choisi
 
-        # Affichage avec panneau de filtres (si on a scanné ce deck)
         if 'format_df' in st.session_state and st.session_state.get('format_deck_view') == deck_choisi:
             display_interactive_dataframe(st.session_state['format_df'])
