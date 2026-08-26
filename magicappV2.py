@@ -32,11 +32,6 @@ def update_price_history(scryfall_data, format_name="Global"):
     def _write_to_sheet(sheet_name):
         try:
             df = conn.read(worksheet=sheet_name, usecols=[0, 1, 2], ttl=0)
-            # SÉCURITÉ ABSOLUE : On force les noms exacts pour éviter les doublons
-            if len(df.columns) == 3:
-                df.columns = ["Date", "Card Name", "Price"]
-            else:
-                df = pd.DataFrame(columns=["Date", "Card Name", "Price"])
         except Exception:
             df = pd.DataFrame(columns=["Date", "Card Name", "Price"])
 
@@ -50,7 +45,7 @@ def update_price_history(scryfall_data, format_name="Global"):
 
             if price > 0:
                 already_recorded = False
-                if not df.empty:
+                if not df.empty and "Date" in df.columns and "Card Name" in df.columns:
                     already_recorded = ((df["Date"] == today) & (df["Card Name"] == name)).any()
 
                 if not already_recorded:
@@ -59,16 +54,13 @@ def update_price_history(scryfall_data, format_name="Global"):
         if new_rows:
             df_new = pd.DataFrame(new_rows)
             df_updated = pd.concat([df, df_new], ignore_index=True)
-            
-            # SÉCURITÉ ANTI-DOUBLON : On force le tableau final à ne garder que ces 3 colonnes
-            df_updated = df_updated[["Date", "Card Name", "Price"]]
-            
             try:
                 conn.update(worksheet=sheet_name, data=df_updated)
             except Exception as e:
-                st.warning(f"⚠️ Impossible d'écrire dans l'onglet '{sheet_name}'. Vérifiez qu'il existe.")
+                st.warning(f"⚠️ Impossible d'écrire dans l'onglet '{sheet_name}'. Vérifiez qu'il existe sur Google Sheets.")
 
     _write_to_sheet("Global")
+
     if format_name and format_name != "Global":
         _write_to_sheet(format_name)
 
@@ -76,9 +68,6 @@ def load_price_history(card_names):
     conn = get_gsheets_connection()
     try:
         df = conn.read(worksheet="Global", usecols=[0, 1, 2], ttl=3600)
-        # SÉCURITÉ LECTURE :
-        if len(df.columns) == 3:
-            df.columns = ["Date", "Card Name", "Price"]
         df = df.dropna(subset=["Card Name"])
         return df[df["Card Name"].isin(card_names)]
     except Exception:
@@ -351,7 +340,6 @@ def display_card_grid(dataframe):
                         
                     st.success(f"**{card['Prix €']:.2f} €**")
                     
-                    # SÉCURITÉ ANTI-CRASH DU GRAPHIQUE
                     hist = load_price_history([card['Nom de la Carte']])
                     required_cols = ['Date', 'Card Name', 'Price']
                     
@@ -396,35 +384,39 @@ if menu == "🐉 cEDH (EDHTop16)":
         arch_list = ["🌟 Aperçu du Format (Staples Globales)"] + sorted(list(commanders.keys()))
         deck_choisi = st.selectbox("Sélectionnez une vue :", arch_list)
         
-        if st.button(f"🚀 Scanner : {deck_choisi}"):
-            with st.spinner("Recherche des cartes cachées dans EDHTop16..."):
+        # --- AUTOMATISATION DU SCAN (Plus de bouton) ---
+        if 'cedh_deck_view' not in st.session_state or st.session_state['cedh_deck_view'] != deck_choisi:
+            with st.spinner(f"Scan automatique de {deck_choisi}..."):
                 cmd_raw_url = "ALL" if deck_choisi == "🌟 Aperçu du Format (Staples Globales)" else commanders[deck_choisi]
                 deck_cards = get_edhtop16_staples(cmd_raw_url)
                 
                 if deck_cards:
-                    st.info(f"✅ Extraction réussie ! Validation de {len(deck_cards)} cartes via Scryfall...")
-                    with st.spinner("Analyse financière et nouveautés en cours..."):
-                        card_names = list(set([c["name"] for c in deck_cards]))
-                        scryfall_data = fetch_scryfall_batch(card_names)
-                        update_price_history(scryfall_data, format_name="cEDH")
+                    st.info(f"✅ Validation de {len(deck_cards)} cartes via Scryfall...")
+                    card_names = list(set([c["name"] for c in deck_cards]))
+                    scryfall_data = fetch_scryfall_batch(card_names)
+                    update_price_history(scryfall_data, format_name="cEDH")
+                    
+                    incl_map = {c["name"]: c["inclusion"] for c in deck_cards}
+                    table_data = []
+                    for c in scryfall_data:
+                        full_name = c.get("name")
+                        front_name = full_name.split(" // ")[0].strip()
+                        statut_nom, tri_val = determine_card_status(c, RECENT_SETS)
+                        table_data.append({
+                            "Tri_Statut": tri_val, 
+                            "Inclusion": incl_map.get(front_name) or incl_map.get(full_name, 0.0),
+                            "Image": extract_card_image(c),
+                            "Nom de la Carte": full_name,
+                            "Édition": get_set_and_year(c),
+                            "Prix €": float(c.get("prices", {}).get("eur") or 0.0),
+                        })
                         
-                        incl_map = {c["name"]: c["inclusion"] for c in deck_cards}
-                        table_data = []
-                        for c in scryfall_data:
-                            full_name = c.get("name")
-                            front_name = full_name.split(" // ")[0].strip()
-                            statut_nom, tri_val = determine_card_status(c, RECENT_SETS)
-                            table_data.append({
-                                "Tri_Statut": tri_val, 
-                                "Inclusion": incl_map.get(front_name) or incl_map.get(full_name, 0.0),
-                                "Image": extract_card_image(c),
-                                "Nom de la Carte": full_name,
-                                "Édition": get_set_and_year(c),
-                                "Prix €": float(c.get("prices", {}).get("eur") or 0.0),
-                            })
-                            
-                        st.session_state['cedh_df'] = pd.DataFrame(table_data)
-                        st.session_state['cedh_deck_view'] = deck_choisi
+                    st.session_state['cedh_df'] = pd.DataFrame(table_data)
+                else:
+                    st.session_state['cedh_df'] = pd.DataFrame()
+                
+                # On sauvegarde le fait qu'on a bien scanné ce deck
+                st.session_state['cedh_deck_view'] = deck_choisi
 
         if 'cedh_df' in st.session_state and st.session_state.get('cedh_deck_view') == deck_choisi:
             display_interactive_dataframe(st.session_state['cedh_df'])
@@ -435,14 +427,15 @@ if menu == "🐉 cEDH (EDHTop16)":
 elif menu == "🏠 Accueil (Toutes Nouveautés)":
     st.title("🔥 Nouvelles Cartes du Métagame Global")
     
-    if st.button("Lancer le Scanner Global"):
+    # --- AUTOMATISATION DU SCAN GLOBAL ---
+    if 'home_scanned' not in st.session_state:
         progress_bar = st.progress(0)
         status_text = st.empty()
         global_new_cards = {}
         formats_list = list(FORMAT_MAP.items())
         
         for i, (fmt_name, fmt_code) in enumerate(formats_list):
-            status_text.text(f"Analyse des archétypes en {fmt_name}...")
+            status_text.text(f"Scan automatique : {fmt_name}...")
             arch_resp = get_mtgtop8_archetypes(fmt_code)
             
             if not arch_resp.get("error"):
@@ -483,6 +476,7 @@ elif menu == "🏠 Accueil (Toutes Nouveautés)":
         progress_bar.empty()
         status_text.empty()
         st.session_state['home_df'] = pd.DataFrame(home_cards)
+        st.session_state['home_scanned'] = True
 
     if 'home_df' in st.session_state:
         display_interactive_dataframe(st.session_state['home_df'])
@@ -504,7 +498,9 @@ else:
         arch_list = ["🌟 Aperçu du Format (Nouvelles Cartes)"] + list(archetypes.keys())
         deck_choisi = st.selectbox("Sélectionnez une vue :", arch_list)
         
-        if st.button(f"🚀 Scanner : {deck_choisi}"):
+        # --- AUTOMATISATION DU SCAN MTGTOP8 ---
+        if 'format_deck_view' not in st.session_state or st.session_state['format_deck_view'] != deck_choisi:
+            
             if deck_choisi == "🌟 Aperçu du Format (Nouvelles Cartes)":
                 progress_bar = st.progress(0)
                 status_text = st.empty()
@@ -512,7 +508,7 @@ else:
                 
                 top_archs_names = list(archetypes.keys())[:5]
                 for i, arch_name in enumerate(top_archs_names):
-                    status_text.text(f"Analyse de l'archétype : {arch_name}...")
+                    status_text.text(f"Analyse automatique : {arch_name}...")
                     deck_ids = get_all_deck_ids(archetypes[arch_name])
                     aggregated_cards = fetch_aggregated_decks(deck_ids[:5])
                     
@@ -552,42 +548,39 @@ else:
                 st.session_state['format_deck_view'] = deck_choisi
                 
             else:
-                with st.spinner(f"Extraction de TOUS les decks pour {deck_choisi}..."):
+                with st.spinner(f"Scan automatique des tournois pour {deck_choisi}..."):
                     deck_ids = get_all_deck_ids(archetypes[deck_choisi])
                     if deck_ids:
-                        st.info(f"✅ L'algorithme croise actuellement **{len(deck_ids)} decks de tournois** en temps réel.")
                         deck_cards = fetch_aggregated_decks(deck_ids)
                         
                         if deck_cards:
-                            with st.spinner("Analyse financière avec Scryfall..."):
-                                scryfall_data = fetch_scryfall_batch([c["name"] for c in deck_cards])
-                                update_price_history(scryfall_data, format_name=menu)
+                            scryfall_data = fetch_scryfall_batch([c["name"] for c in deck_cards])
+                            update_price_history(scryfall_data, format_name=menu)
+                            
+                            incl_map = {c["name"]: c["inclusion"] for c in deck_cards}
+                            table_data = []
+                            for c in scryfall_data:
+                                full_name = c.get("name")
+                                front_name = full_name.split(" // ")[0].strip()
+                                statut_nom, tri_val = determine_card_status(c, RECENT_SETS)
+                                table_data.append({
+                                    "Tri_Statut": tri_val, 
+                                    "Inclusion": incl_map.get(front_name) or incl_map.get(full_name, 0.0),
+                                    "Image": extract_card_image(c),
+                                    "Nom de la Carte": full_name,
+                                    "Édition": get_set_and_year(c),
+                                    "Prix €": float(c.get("prices", {}).get("eur") or 0.0),
+                                })
                                 
-                                incl_map = {c["name"]: c["inclusion"] for c in deck_cards}
-                                table_data = []
-                                for c in scryfall_data:
-                                    full_name = c.get("name")
-                                    front_name = full_name.split(" // ")[0].strip()
-                                    statut_nom, tri_val = determine_card_status(c, RECENT_SETS)
-                                    table_data.append({
-                                        "Tri_Statut": tri_val, 
-                                        "Inclusion": incl_map.get(front_name) or incl_map.get(full_name, 0.0),
-                                        "Image": extract_card_image(c),
-                                        "Nom de la Carte": full_name,
-                                        "Édition": get_set_and_year(c),
-                                        "Prix €": float(c.get("prices", {}).get("eur") or 0.0),
-                                    })
-                                    
-                                st.session_state['format_df'] = pd.DataFrame(table_data)
-                                st.session_state['format_deck_view'] = deck_choisi
+                            st.session_state['format_df'] = pd.DataFrame(table_data)
                         else:
                             st.session_state['format_df'] = pd.DataFrame()
-                            st.session_state['format_deck_view'] = deck_choisi
                             
                     else:
                         st.warning("Aucun deck n'a pu être extrait pour cet archétype.")
                         st.session_state['format_df'] = pd.DataFrame()
-                        st.session_state['format_deck_view'] = deck_choisi
+                        
+                st.session_state['format_deck_view'] = deck_choisi
 
         if 'format_df' in st.session_state and st.session_state.get('format_deck_view') == deck_choisi:
             display_interactive_dataframe(st.session_state['format_df'])
